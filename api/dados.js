@@ -1,106 +1,128 @@
 import mongoose from 'mongoose';
-import cors from 'cors';
 
-// Middleware CORS
-const corsOptions = {
-  origin: ['http://localhost:3000', 'https://seu-frontend.com'],
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-};
-
-// Schema MongoDB
+// Schema MongoDB - apenas campos essenciais
 const DadosSchema = new mongoose.Schema({
   temperatura: { type: Number, required: true },
   umidade: { type: Number, required: true },
   dispositivo: { type: String, required: true },
-  timestamp: { type: Date, default: Date.now },
+  timestamp: { type: Date, default: Date.now }
 });
 
-let Dados;
+// Variável global para manter a conexão
+let cachedDb = null;
+let Dados = null;
 
-// Conectar ao MongoDB
 async function conectarMongoDB() {
-  if (mongoose.connections[0].readyState) {
-    return;
+  if (cachedDb && mongoose.connection.readyState === 1) {
+    return cachedDb;
   }
-  
+
   try {
-    await mongoose.connect(process.env.MONGODB_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
+    const uri = process.env.MONGODB_URI;
+    
+    if (!uri) {
+      throw new Error('MONGODB_URI não está definida');
+    }
+
+    const conn = await mongoose.connect(uri, {
+      bufferCommands: false,
     });
-    console.log('MongoDB conectado');
+
+    cachedDb = conn;
+    
+    // Criar modelo se não existir
+    if (!Dados) {
+      Dados = mongoose.models.Dados || mongoose.model('Dados', DadosSchema);
+    }
+
+    console.log('MongoDB conectado com sucesso');
+    return cachedDb;
   } catch (error) {
-    console.error('Erro ao conectar MongoDB:', error);
+    console.error('Erro ao conectar MongoDB:', error.message);
     throw error;
   }
 }
 
-// Handler principal da Vercel
 export default async function handler(req, res) {
-  // Aplicar CORS
-  await new Promise((resolve, reject) => {
-    cors(corsOptions)(req, res, (result) => {
-      if (result instanceof Error) {
-        return reject(result);
-      }
-      return resolve(result);
-    });
-  });
+  // Configurar CORS manualmente
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // Conectar ao banco
-  await conectarMongoDB();
-  
-  // Inicializar modelo se não existir
-  if (!Dados) {
-    Dados = mongoose.models.Dados || mongoose.model('Dados', DadosSchema);
+  // Responder OPTIONS (preflight)
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
   }
 
-  const { method } = req;
-
-  switch (method) {
-    case 'POST':
-      return await criarDados(req, res);
-    case 'GET':
-      return await obterDados(req, res);
-    default:
-      res.setHeader('Allow', ['GET', 'POST']);
-      return res.status(405).json({ error: `Método ${method} não permitido` });
-  }
-}
-
-// Criar novos dados (ESP32 → API)
-async function criarDados(req, res) {
   try {
-    const { temperatura, umidade, dispositivo } = req.body;
+    // Conectar ao MongoDB
+    await conectarMongoDB();
 
-    // Validação básica
-    if (!temperatura || !umidade || !dispositivo) {
-      return res.status(400).json({ 
-        error: 'Campos obrigatórios: temperatura, umidade, dispositivo' 
+    const { method } = req;
+
+    // GET - Buscar dados
+    if (method === 'GET') {
+      const { limite = 50, dispositivo } = req.query;
+
+      let filtros = {};
+      if (dispositivo) {
+        filtros.dispositivo = dispositivo;
+      }
+
+      const dados = await Dados
+        .find(filtros)
+        .sort({ timestamp: -1 })
+        .limit(parseInt(limite))
+        .lean();
+
+      const total = await Dados.countDocuments(filtros);
+
+      return res.status(200).json({
+        success: true,
+        total,
+        dados
       });
     }
 
-    const novosDados = new Dados({
-      temperatura: parseFloat(temperatura),
-      umidade: parseFloat(umidade),
-      dispositivo: String(dispositivo),
-    });
+    // POST - Criar dados
+    if (method === 'POST') {
+      const { temperatura, umidade, dispositivo } = req.body;
 
-    const dadosSalvos = await novosDados.save();
+      // Validação
+      if (!temperatura || !umidade || !dispositivo) {
+        return res.status(400).json({
+          success: false,
+          error: 'Campos obrigatórios: temperatura, umidade, dispositivo'
+        });
+      }
 
-    return res.status(201).json({
-      success: true,
-      message: 'Dados salvos com sucesso',
-      id: dadosSalvos._id,
-      timestamp: dadosSalvos.timestamp
+      const novosDados = new Dados({
+        temperatura: parseFloat(temperatura),
+        umidade: parseFloat(umidade),
+        dispositivo: String(dispositivo)
+      });
+
+      const dadosSalvos = await novosDados.save();
+
+      return res.status(201).json({
+        success: true,
+        message: 'Dados salvos com sucesso',
+        id: dadosSalvos._id
+      });
+    }
+
+    // Método não permitido
+    return res.status(405).json({
+      success: false,
+      error: `Método ${method} não permitido`
     });
 
   } catch (error) {
-    console.error('Erro ao salvar dados:', error);
-    return res.status(500).json({ 
+    console.error('Erro na função:', error);
+    return res.status(500).json({
+      success: false,
       error: 'Erro interno do servidor',
-      details: error.message 
+      message: error.message
     });
   }
 }
